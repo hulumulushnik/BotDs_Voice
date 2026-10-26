@@ -1,0 +1,95 @@
+name: Deploy (Cybrancee)
+
+# Схема:
+#   CI зелёный на main  →  ветка `production` переводится на этот коммит
+#                        →  перезапуск сервера через API панели (Pterodactyl)
+#                        →  при старте сервер делает git pull ветки `production`
+#                           и ставит зависимости из requirements.txt.
+# Так на хостинг попадает только код, прошедший проверки.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main, master]
+  workflow_dispatch:   # ручной перезапуск деплоя текущего main
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Cybrancee
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: write   # обновить ветку production
+    env:
+      PANEL_URL: ${{ secrets.PTERO_PANEL_URL }}
+      SERVER_ID: ${{ secrets.PTERO_SERVER_ID }}
+      API_KEY: ${{ secrets.PTERO_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve commit
+        id: target
+        env:
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          sha="$(git rev-parse --verify "${RUN_SHA:-$GITHUB_SHA}^{commit}")"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Деплоим $sha"
+
+      - name: Check secrets
+        run: |
+          for name in PANEL_URL SERVER_ID API_KEY; do
+            [ -n "${!name}" ] || { echo "::error::Не задан секрет для $name (см. docs/DEPLOY.md)"; exit 1; }
+          done
+
+      - name: Move `production` branch
+        env:
+          SHA: ${{ steps.target.outputs.sha }}
+        # Только fast-forward: на сервере `git pull` не умеет «откатываться назад».
+        # Откат делается через `git revert` в main — он тоже проходит CI.
+        run: |
+          git push origin "$SHA:refs/heads/production" \
+            || { echo "::error::production нельзя перемотать на $SHA без force (история переписана?)"; exit 1; }
+
+      - name: Restart server (git pull + pip install при старте)
+        run: |
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -d '{"signal":"restart"}' \
+            "${PANEL_URL%/}/api/client/servers/$SERVER_ID/power"
+
+      - name: Wait until bot is up
+        # В Pterodactyl после рестарта: stopping → offline → starting → running.
+        # Python-эггу не всегда видна «строка готовности», поэтому живым считаем starting/running.
+        run: |
+          api() {
+            curl -sS -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" \
+              "${PANEL_URL%/}/api/client/servers/$SERVER_ID/resources" | jq -r '.attributes.current_state'
+          }
+          sleep 10
+          state=""
+          for _ in $(seq 1 34); do          # до ~3 минут: git pull + pip install
+            state="$(api || true)"
+            echo "Состояние: $state"
+            case "$state" in starting|running) break ;; esac
+            sleep 5
+          done
+          case "$state" in starting|running) ;; *)
+            echo "::error::Сервер не запустился (состояние: $state)"; exit 1 ;;
+          esac
+
+          # Бот не должен упасть сразу после старта (неверный токен, ошибка импорта и т.п.)
+          sleep 45
+          state="$(api || true)"
+          case "$state" in starting|running) echo "Бот работает ✅ (состояние: $state)" ;; *)
+            echo "::error::Бот упал после запуска (состояние: $state) — смотрите консоль в панели"; exit 1 ;;
+          esac

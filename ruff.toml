@@ -1,0 +1,13 @@
+target-version = "py310"
+line-length = 120
+extend-exclude = ["data"]
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "UP006", "UP007", "UP035",  # typing.Optional/List — оставляем для Python 3.10-совместимого стиля
+    "B008",
+]
+
+[lint.isort]
+known-first-party = ["cogs", "core", "config", "tests"]
